@@ -55,6 +55,7 @@ lancedb/
 
 # Local models & caches
 models/
+pretrained_models/
 *.gguf
 *.bin
 *.safetensors

@@ -1,5 +1,13 @@
-"""แปลงทุกท่อนเป็นเวกเตอร์ (embedding) แล้วเก็บลง ChromaDB เพื่อใช้ค้นหาด้วยความหมาย"""
+"""แปลงทุกท่อนเป็นเวกเตอร์ (embedding) แล้วเก็บลง ChromaDB เพื่อใช้ค้นหาด้วยความหมาย
 
+ตัวอย่างการรัน:
+    python scripts/build_index.py
+    python scripts/build_index.py --model pretrained_models/bge-m3
+    python scripts/build_index.py --model intfloat/multilingual-e5-small --batch-size 32
+    python scripts/build_index.py --help
+"""
+
+import argparse
 import json
 from pathlib import Path
 
@@ -10,9 +18,70 @@ CHUNKS_PATH = Path("data/chunks/chunks.jsonl")
 INDEX_DIR = Path("data/index")
 COLLECTION_NAME = "wikipedia"
 
-MODEL_NAME = "BAAI/bge-m3"  # ถ้าเครื่องช้า ลอง "intfloat/multilingual-e5-small"
-MAX_TOKENS = 512            # ท่อนเรายาวไม่เกิน 500 ตัวอักษร จึงไม่ต้องใช้ถึง 8,192 token
-BATCH_SIZE = 16             # แปลงทีละกี่ท่อน (ถ้าแรมไม่พอให้ลดลง)
+DEFAULT_MODEL = "BAAI/bge-m3"
+
+
+def parse_args() -> argparse.Namespace:
+    """อ่านค่าที่ผู้ใช้พิมพ์ต่อท้ายคำสั่งตอนรัน"""
+    parser = argparse.ArgumentParser(
+        description="สร้างดัชนีเวกเตอร์จาก chunks.jsonl แล้วเก็บลง ChromaDB"
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=(
+            "ชื่อโมเดลบน Hugging Face (เช่น BAAI/bge-m3) "
+            "หรือ path ของโฟลเดอร์โมเดลในเครื่อง (เช่น pretrained_models/bge-m3) "
+            f"ค่าเริ่มต้น: {DEFAULT_MODEL}"
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="แปลงทีละกี่ท่อน ถ้าแรมไม่พอให้ลดลง (ค่าเริ่มต้น: 16)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="ความยาวข้อความสูงสุดที่ให้โมเดลอ่าน หน่วยเป็น token (ค่าเริ่มต้น: 512)",
+    )
+    parser.add_argument(
+        "--query-prefix",
+        default=None,
+        help="ข้อความที่ต้องเติมหน้าคำถาม (ถ้าไม่ระบุ จะเลือกให้อัตโนมัติตามโมเดล)",
+    )
+    parser.add_argument(
+        "--passage-prefix",
+        default=None,
+        help="ข้อความที่ต้องเติมหน้าเนื้อหา (ถ้าไม่ระบุ จะเลือกให้อัตโนมัติตามโมเดล)",
+    )
+    return parser.parse_args()
+
+
+def decide_prefixes(model: str, query_prefix, passage_prefix) -> tuple[str, str]:
+    """บางโมเดลต้องเติมคำนำหน้าข้อความถึงจะทำงานได้ดี
+
+    - โมเดลตระกูล e5 ถูกฝึกมาให้เห็น "query: " หน้าคำถาม และ "passage: " หน้าเนื้อหา
+    - bge-m3 ไม่ต้องเติมอะไร
+    ถ้าผู้ใช้ระบุเองผ่าน --query-prefix / --passage-prefix จะใช้ค่าที่ระบุแทน
+    """
+    is_e5 = "e5" in model.lower()
+
+    if query_prefix is None:
+        if is_e5:
+            query_prefix = "query: "
+        else:
+            query_prefix = ""
+
+    if passage_prefix is None:
+        if is_e5:
+            passage_prefix = "passage: "
+        else:
+            passage_prefix = ""
+
+    return query_prefix, passage_prefix
 
 
 def read_chunks(path: Path) -> list[dict]:
@@ -38,6 +107,11 @@ def text_for_embedding(chunk: dict) -> str:
 
 
 def main():
+    args = parse_args()
+    query_prefix, passage_prefix = decide_prefixes(
+        args.model, args.query_prefix, args.passage_prefix
+    )
+
     # ① อ่านท่อนทั้งหมด
     chunks = read_chunks(CHUNKS_PATH)
     print(f"อ่านได้ {len(chunks)} ท่อน จาก {CHUNKS_PATH}")
@@ -57,19 +131,26 @@ def main():
             "section": chunk["section"],
             "url": chunk["url"],
         })
-        embed_texts.append(text_for_embedding(chunk))
+        embed_texts.append(passage_prefix + text_for_embedding(chunk))
 
-    # ③ โหลดโมเดล (ครั้งแรกจะดาวน์โหลดประมาณ 2 GB)
-    print(f"กำลังโหลดโมเดล {MODEL_NAME} ...")
-    model = SentenceTransformer(MODEL_NAME)
-    model.max_seq_length = MAX_TOKENS
+    # ③ โหลดโมเดล
+    if Path(args.model).exists():
+        print(f"กำลังโหลดโมเดลจากโฟลเดอร์ในเครื่อง: {args.model}")
+    else:
+        print(f"ไม่พบโฟลเดอร์ '{args.model}' ในเครื่อง จะโหลดจาก Hugging Face แทน")
+        print("(ครั้งแรกอาจใช้เวลานาน ครั้งต่อไปจะใช้ไฟล์ที่เก็บไว้)")
+
+    model = SentenceTransformer(args.model)
+    model.max_seq_length = args.max_tokens
     print(f"ใช้อุปกรณ์: {model.device}")  # cuda = GPU, cpu = CPU
+    if query_prefix != "" or passage_prefix != "":
+        print(f"คำนำหน้า: query='{query_prefix}' passage='{passage_prefix}'")
 
     # ④ แปลงข้อความเป็นเวกเตอร์
     print("กำลังแปลงข้อความเป็นเวกเตอร์ ...")
     vectors = model.encode(
         embed_texts,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         normalize_embeddings=True,  # ปรับความยาวเวกเตอร์เป็น 1 ใช้เทียบแบบ cosine ได้
         show_progress_bar=True,
     )
@@ -91,8 +172,10 @@ def main():
     collection = client.create_collection(
         name=COLLECTION_NAME,
         metadata={
-            "hnsw:space": "cosine",         # วัดความใกล้ด้วย cosine
-            "embedding_model": MODEL_NAME,  # จดไว้ ตอนค้นหาต้องใช้โมเดลเดียวกัน
+            "hnsw:space": "cosine",  # วัดความใกล้ด้วย cosine
+            # จดไว้ ตอนค้นหา (search.py) ต้องใช้โมเดลและคำนำหน้าเดียวกัน
+            "embedding_model": args.model,
+            "query_prefix": query_prefix,
         },
     )
 
@@ -112,7 +195,9 @@ def main():
     question = "ธนาคารแห่งประเทศไทยก่อตั้งเมื่อไร"
     print(f"\nทดสอบค้นหา: {question}")
 
-    question_vector = model.encode([question], normalize_embeddings=True).tolist()
+    question_vector = model.encode(
+        [query_prefix + question], normalize_embeddings=True
+    ).tolist()
     results = collection.query(query_embeddings=question_vector, n_results=3)
 
     # results มีโครงสร้างแบบ list ซ้อน list เพราะค้นได้หลายคำถามพร้อมกัน
