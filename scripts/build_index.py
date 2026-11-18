@@ -4,14 +4,18 @@
     python scripts/build_index.py
     python scripts/build_index.py --model pretrained_models/bge-m3
     python scripts/build_index.py --model intfloat/multilingual-e5-small --batch-size 32
+    python scripts/build_index.py --device cpu
+    python scripts/build_index.py --device cuda:0 --batch-size 8
     python scripts/build_index.py --help
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import chromadb
+import torch
 from sentence_transformers import SentenceTransformer
 
 CHUNKS_PATH = Path("data/chunks/chunks.jsonl")
@@ -33,6 +37,15 @@ def parse_args() -> argparse.Namespace:
             "ชื่อโมเดลบน Hugging Face (เช่น BAAI/bge-m3) "
             "หรือ path ของโฟลเดอร์โมเดลในเครื่อง (เช่น pretrained_models/bge-m3) "
             f"ค่าเริ่มต้น: {DEFAULT_MODEL}"
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "อุปกรณ์ที่ใช้ประมวลผล: auto (ใช้ GPU ถ้ามี ไม่มีก็ใช้ CPU), "
+            "cpu, cuda (GPU ตัวแรก) หรือ cuda:0, cuda:1 ... เพื่อเลือก GPU ตามลำดับ "
+            "(ค่าเริ่มต้น: auto)"
         ),
     )
     parser.add_argument(
@@ -58,6 +71,48 @@ def parse_args() -> argparse.Namespace:
         help="ข้อความที่ต้องเติมหน้าเนื้อหา (ถ้าไม่ระบุ จะเลือกให้อัตโนมัติตามโมเดล)",
     )
     return parser.parse_args()
+
+
+def decide_device(requested: str) -> str:
+    """ตรวจและเลือกอุปกรณ์ตามที่ผู้ใช้ขอ ถ้าขอ GPU แต่ใช้ไม่ได้ จะหยุดโปรแกรมพร้อมบอกเหตุผล"""
+    requested = requested.lower()
+    gpu_available = torch.cuda.is_available()
+
+    if requested == "auto":
+        if gpu_available:
+            return "cuda:0"
+        return "cpu"
+
+    if requested == "cpu":
+        return "cpu"
+
+    if requested.startswith("cuda"):
+        if not gpu_available:
+            print("✘ ขอใช้ GPU แต่ PyTorch มองไม่เห็น GPU")
+            print(f"  PyTorch เวอร์ชัน: {torch.__version__}")
+            print("  ถ้าเวอร์ชันลงท้ายด้วย +cpu ต้องติดตั้ง PyTorch เวอร์ชัน CUDA ก่อน")
+            print("  หรือรันด้วย --device cpu แทน")
+            sys.exit(1)
+
+        # "cuda" เฉยๆ หมายถึง GPU ตัวแรก
+        if requested == "cuda":
+            return "cuda:0"
+
+        # "cuda:1" → เช็กว่ามี GPU ตัวที่ 1 จริงไหม (นับจาก 0)
+        index_text = requested.split(":")[1]
+        if not index_text.isdigit():
+            print(f"✘ รูปแบบ --device ไม่ถูกต้อง: '{requested}' (ตัวอย่างที่ถูก: cuda:0)")
+            sys.exit(1)
+
+        index = int(index_text)
+        gpu_count = torch.cuda.device_count()
+        if index >= gpu_count:
+            print(f"✘ ไม่มี GPU ตัวที่ {index} (เครื่องนี้มี GPU {gpu_count} ตัว: cuda:0 ถึง cuda:{gpu_count - 1})")
+            sys.exit(1)
+        return requested
+
+    print(f"✘ ไม่รู้จัก --device '{requested}' (ใช้ได้: auto, cpu, cuda, cuda:0, cuda:1, ...)")
+    sys.exit(1)
 
 
 def decide_prefixes(model: str, query_prefix, passage_prefix) -> tuple[str, str]:
@@ -108,6 +163,7 @@ def text_for_embedding(chunk: dict) -> str:
 
 def main():
     args = parse_args()
+    device = decide_device(args.device)
     query_prefix, passage_prefix = decide_prefixes(
         args.model, args.query_prefix, args.passage_prefix
     )
@@ -140,9 +196,13 @@ def main():
         print(f"ไม่พบโฟลเดอร์ '{args.model}' ในเครื่อง จะโหลดจาก Hugging Face แทน")
         print("(ครั้งแรกอาจใช้เวลานาน ครั้งต่อไปจะใช้ไฟล์ที่เก็บไว้)")
 
-    model = SentenceTransformer(args.model)
+    model = SentenceTransformer(args.model, device=device)
     model.max_seq_length = args.max_tokens
-    print(f"ใช้อุปกรณ์: {model.device}")  # cuda = GPU, cpu = CPU
+
+    if device == "cpu":
+        print("ใช้อุปกรณ์: cpu")
+    else:
+        print(f"ใช้อุปกรณ์: {device} ({torch.cuda.get_device_name(device)})")
     if query_prefix != "" or passage_prefix != "":
         print(f"คำนำหน้า: query='{query_prefix}' passage='{passage_prefix}'")
 
