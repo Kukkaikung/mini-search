@@ -177,6 +177,7 @@ def search(collection, model, query_prefix: str, question: str, top_k: int, titl
         results.append({
             "chunk_id": raw["ids"][0][i],
             "score": 1 - raw["distances"][0][i],  # distance → ความคล้าย (cosine)
+            "article_id": meta["article_id"],
             "title": meta["title"],
             "section": meta["section"],
             "url": meta["url"],

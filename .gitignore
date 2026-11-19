@@ -73,6 +73,9 @@ docs_raw/
 !data/.gitkeep
 !uploads/.gitkeep
 
+# Evaluation (ชุดคำถามทดสอบ)
+eval/
+
 # Local databases
 *.db
 *.sqlite
