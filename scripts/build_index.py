@@ -1,16 +1,19 @@
 """แปลงทุกท่อนเป็นเวกเตอร์ (embedding) แล้วเก็บลง ChromaDB เพื่อใช้ค้นหาด้วยความหมาย
 
+แต่ละโมเดลจะถูกเก็บแยกเป็นคนละ collection (ตั้งชื่ออัตโนมัติจากชื่อโมเดล)
+จึงสร้างดัชนีหลายโมเดลไว้เทียบกันได้ โดยไม่ทับกัน
+
 ตัวอย่างการรัน:
-    python scripts/build_index.py
-    python scripts/build_index.py --model pretrained_models/bge-m3
-    python scripts/build_index.py --model intfloat/multilingual-e5-small --batch-size 32
-    python scripts/build_index.py --device cpu
-    python scripts/build_index.py --device cuda:0 --batch-size 8
+    python scripts/build_index.py --model pretrained_models/bge-m3 --device cuda --batch-size 8
+    python scripts/build_index.py --model pretrained_models/multilingual-e5-small --device cuda
+    python scripts/build_index.py --model pretrained_models/bge-m3 --collection bge-m3-chunk300
     python scripts/build_index.py --help
 """
 
 import argparse
 import json
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import chromadb
@@ -18,11 +21,13 @@ from sentence_transformers import SentenceTransformer
 
 from common import decide_device, describe_device
 
-CHUNKS_PATH = Path("data/chunks/chunks.jsonl")
+DEFAULT_CHUNKS = "data/chunks/chunks.jsonl"
 INDEX_DIR = Path("data/index")
-COLLECTION_NAME = "wikipedia"
-
 DEFAULT_MODEL = "BAAI/bge-m3"
+DEFAULT_TEST_QUERY = "ธนาคารแห่งประเทศไทยก่อตั้งเมื่อไร"
+
+# ตัวอักษรที่ ChromaDB ยอมให้ใช้ในชื่อ collection
+ALLOWED_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +43,19 @@ def parse_args() -> argparse.Namespace:
             "หรือ path ของโฟลเดอร์โมเดลในเครื่อง (เช่น pretrained_models/bge-m3) "
             f"ค่าเริ่มต้น: {DEFAULT_MODEL}"
         ),
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help=(
+            "ชื่อ collection ที่จะเก็บใน ChromaDB "
+            "(ถ้าไม่ระบุ จะตั้งจากชื่อโมเดล เช่น pretrained_models/bge-m3 → bge-m3)"
+        ),
+    )
+    parser.add_argument(
+        "--chunks",
+        default=DEFAULT_CHUNKS,
+        help=f"ไฟล์ท่อนข้อความที่จะนำมาทำดัชนี (ค่าเริ่มต้น: {DEFAULT_CHUNKS})",
     )
     parser.add_argument(
         "--device",
@@ -70,7 +88,62 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="ข้อความที่ต้องเติมหน้าเนื้อหา (ถ้าไม่ระบุ จะเลือกให้อัตโนมัติตามโมเดล)",
     )
+    parser.add_argument(
+        "--test-query",
+        default=DEFAULT_TEST_QUERY,
+        help="คำถามที่ใช้ทดสอบค้นหาหลังสร้างดัชนีเสร็จ",
+    )
     return parser.parse_args()
+
+
+def make_collection_name(model: str) -> str:
+    """ตั้งชื่อ collection จากชื่อโมเดล
+
+    ตัวอย่าง:
+        "pretrained_models/bge-m3"          → "bge-m3"
+        "BAAI/bge-m3"                        → "bge-m3"
+        "intfloat/multilingual-e5-small"     → "multilingual-e5-small"
+    """
+    # เอาเฉพาะส่วนท้ายสุดของ path (ชื่อโฟลเดอร์ หรือชื่อโมเดลหลัง /)
+    base_name = Path(model).name
+
+    # เปลี่ยนตัวอักษรที่ ChromaDB ไม่ยอมรับให้เป็น "-"
+    cleaned = ""
+    for char in base_name:
+        if char in ALLOWED_NAME_CHARS:
+            cleaned += char
+        else:
+            cleaned += "-"
+    return cleaned
+
+
+def check_collection_name(name: str):
+    """ตรวจชื่อ collection ตามกฎของ ChromaDB ถ้าไม่ผ่านจะหยุดโปรแกรมพร้อมบอกเหตุผล
+
+    กฎ: ยาว 3-512 ตัวอักษร, ใช้ได้เฉพาะ a-z A-Z 0-9 . _ -,
+        ต้องขึ้นต้นและลงท้ายด้วยตัวอักษรหรือตัวเลข
+    """
+    problems = []
+
+    if len(name) < 3 or len(name) > 512:
+        problems.append("ต้องยาว 3-512 ตัวอักษร")
+
+    for char in name:
+        if char not in ALLOWED_NAME_CHARS:
+            problems.append(f"มีตัวอักษรที่ใช้ไม่ได้: '{char}'")
+            break
+
+    if len(name) > 0 and not name[0].isalnum():
+        problems.append("ต้องขึ้นต้นด้วยตัวอักษรหรือตัวเลข")
+    if len(name) > 0 and not name[-1].isalnum():
+        problems.append("ต้องลงท้ายด้วยตัวอักษรหรือตัวเลข")
+
+    if len(problems) > 0:
+        print(f"✘ ชื่อ collection '{name}' ใช้ไม่ได้:")
+        for problem in problems:
+            print(f"  - {problem}")
+        print("  ระบุชื่อเองด้วย --collection เช่น --collection my-model")
+        sys.exit(1)
 
 
 def decide_prefixes(model: str, query_prefix, passage_prefix) -> tuple[str, str]:
@@ -126,9 +199,22 @@ def main():
         args.model, args.query_prefix, args.passage_prefix
     )
 
+    # ตั้งชื่อ collection: ใช้ที่ผู้ใช้ระบุ ถ้าไม่ระบุก็ตั้งจากชื่อโมเดล
+    if args.collection is not None:
+        collection_name = args.collection
+    else:
+        collection_name = make_collection_name(args.model)
+    check_collection_name(collection_name)
+    print(f"collection: {collection_name}")
+
     # ① อ่านท่อนทั้งหมด
-    chunks = read_chunks(CHUNKS_PATH)
-    print(f"อ่านได้ {len(chunks)} ท่อน จาก {CHUNKS_PATH}")
+    chunks_path = Path(args.chunks)
+    if not chunks_path.exists():
+        print(f"✘ ไม่พบไฟล์ {chunks_path} ให้รัน python scripts\\chunk.py ก่อน")
+        sys.exit(1)
+
+    chunks = read_chunks(chunks_path)
+    print(f"อ่านได้ {len(chunks)} ท่อน จาก {chunks_path}")
 
     # ② เตรียมข้อมูล 4 อย่างที่ ChromaDB ต้องการ (ลำดับต้องตรงกันทุก list)
     ids = []          # รหัสไม่ซ้ำของแต่ละท่อน
@@ -174,23 +260,28 @@ def main():
     # ChromaDB ต้องการ list ธรรมดา ไม่ใช่ numpy array
     embeddings = vectors.tolist()
 
-    # ⑤ สร้างฐานข้อมูลใหม่ (ลบของเก่าทิ้งก่อน กันข้อมูลเก่าค้างปน)
+    # ⑤ สร้าง collection ใหม่ (ลบเฉพาะ collection ชื่อนี้ ของโมเดลอื่นไม่โดนลบ)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(INDEX_DIR))
 
     try:
-        client.delete_collection(COLLECTION_NAME)
-        print("ลบดัชนีเก่าแล้ว")
+        client.delete_collection(collection_name)
+        print(f"ลบ collection '{collection_name}' เดิมแล้ว (กำลังสร้างใหม่)")
     except Exception:
         pass  # ยังไม่เคยสร้าง ไม่ต้องลบ
 
     collection = client.create_collection(
-        name=COLLECTION_NAME,
+        name=collection_name,
         metadata={
             "hnsw:space": "cosine",  # วัดความใกล้ด้วย cosine
             # จดไว้ ตอนค้นหา (search.py) ต้องใช้โมเดลและคำนำหน้าเดียวกัน
             "embedding_model": args.model,
             "query_prefix": query_prefix,
+            # จดไว้ดูภายหลังว่าดัชนีนี้สร้างจากอะไร เมื่อไร
+            "embedding_dim": int(vectors.shape[1]),
+            "chunks_file": str(chunks_path),
+            "num_chunks": len(chunks),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         },
     )
 
@@ -204,10 +295,17 @@ def main():
             documents=documents[start:end],
             metadatas=metadatas[start:end],
         )
-    print(f"เก็บลง ChromaDB แล้ว {collection.count()} รายการ ที่ {INDEX_DIR}")
+    print(f"เก็บลง ChromaDB แล้ว {collection.count()} รายการ ใน collection '{collection_name}' ที่ {INDEX_DIR}")
+
+    # แสดงรายชื่อ collection ทั้งหมดที่มีในฐานข้อมูลตอนนี้
+    print("\ncollection ทั้งหมดใน ChromaDB:")
+    for existing in client.list_collections():
+        existing_settings = existing.metadata or {}
+        existing_model = existing_settings.get("embedding_model", "?")
+        print(f"  - {existing.name}: {existing.count()} ท่อน (โมเดล: {existing_model})")
 
     # ⑦ ทดสอบค้นหา 1 คำถาม
-    question = "ธนาคารแห่งประเทศไทยก่อตั้งเมื่อไร"
+    question = args.test_query
     print(f"\nทดสอบค้นหา: {question}")
 
     question_vector = model.encode(
