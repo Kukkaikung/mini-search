@@ -1,10 +1,12 @@
 """ค้นหาท่อนข้อความด้วยความหมาย จากดัชนีที่ build_index.py สร้างไว้
 
 ตัวอย่างการรัน:
-    python scripts/search.py                                  # โหมดวนถาม
-    python scripts/search.py --query "แบงก์ชาติมีหน้าที่อะไร"      # ถามครั้งเดียวแล้วจบ
-    python scripts/search.py --top-k 3 --min-score 0.5
-    python scripts/search.py --title "ประเทศไทย"                 # ค้นเฉพาะบทความนี้
+    python scripts/search.py --list                                   # ดูว่ามี collection อะไรบ้าง
+    python scripts/search.py --collection bge-m3                      # โหมดวนถาม
+    python scripts/search.py --collection bge-m3 --query "แบงก์ชาติมีหน้าที่อะไร"
+    python scripts/search.py --collection bge-m3 --top-k 3 --min-score 0.5
+    python scripts/search.py --collection bge-m3 --title "ประเทศไทย"   # ค้นเฉพาะบทความนี้
+    python scripts/search.py --delete wikipedia                       # ลบ collection ที่ไม่ใช้แล้ว
     python scripts/search.py --help
 """
 
@@ -20,12 +22,28 @@ from sentence_transformers import SentenceTransformer
 from common import decide_device, describe_device
 
 INDEX_DIR = Path("data/index")
-COLLECTION_NAME = "wikipedia"
 SNIPPET_CHARS = 200  # แสดงข้อความแต่ละผลลัพธ์ยาวกี่ตัวอักษร
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ค้นหาท่อนข้อความด้วยความหมาย")
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="ชื่อ collection ที่จะค้น (ดูรายชื่อได้ด้วย --list) "
+             "ถ้ามี collection เดียวในฐานข้อมูล ไม่ต้องระบุก็ได้",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="แสดงรายชื่อ collection ทั้งหมดแล้วจบ",
+    )
+    parser.add_argument(
+        "--delete",
+        default=None,
+        metavar="NAME",
+        help="ลบ collection ชื่อนี้ (จะถามยืนยันก่อนลบ) แล้วจบ",
+    )
     parser.add_argument(
         "--query",
         default=None,
@@ -56,20 +74,81 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def open_collection():
-    """เปิดดัชนีที่ build_index.py สร้างไว้ ถ้ายังไม่มีให้บอกวิธีแก้แล้วจบโปรแกรม"""
+def open_client():
+    """เปิดฐานข้อมูล ChromaDB ถ้ายังไม่เคยสร้างให้บอกวิธีแก้แล้วจบโปรแกรม"""
     if not INDEX_DIR.exists():
         print(f"✘ ไม่พบดัชนีที่ {INDEX_DIR}")
         print("  ให้รัน python scripts\\build_index.py ก่อน")
         sys.exit(1)
+    return chromadb.PersistentClient(path=str(INDEX_DIR))
 
-    client = chromadb.PersistentClient(path=str(INDEX_DIR))
-    try:
-        return client.get_collection(COLLECTION_NAME)
-    except Exception:
-        print(f"✘ ไม่พบ collection '{COLLECTION_NAME}' ใน {INDEX_DIR}")
-        print("  ให้รัน python scripts\\build_index.py ก่อน")
+
+def print_collections(client):
+    """แสดงรายชื่อ collection ทั้งหมด พร้อมข้อมูลที่ build_index.py จดไว้"""
+    collections = client.list_collections()
+    if len(collections) == 0:
+        print("ยังไม่มี collection ใน ChromaDB ให้รัน python scripts\\build_index.py ก่อน")
+        return
+
+    print(f"collection ใน {INDEX_DIR}:")
+    for collection in collections:
+        settings = collection.metadata or {}
+        model_name = settings.get("embedding_model", "?")
+        dim = settings.get("embedding_dim", "?")
+        created_at = settings.get("created_at", "?")
+        print(f"  - {collection.name}")
+        print(f"      {collection.count()} ท่อน | โมเดล: {model_name} | {dim} มิติ | สร้างเมื่อ: {created_at}")
+
+
+def delete_collection(client, name: str):
+    """ลบ collection หลังจากผู้ใช้พิมพ์ชื่อซ้ำเพื่อยืนยัน (ลบแล้วกู้คืนไม่ได้)"""
+    existing_names = []
+    for collection in client.list_collections():
+        existing_names.append(collection.name)
+
+    if name not in existing_names:
+        print(f"✘ ไม่พบ collection '{name}'")
+        print_collections(client)
         sys.exit(1)
+
+    collection = client.get_collection(name)
+    print(f"จะลบ collection '{name}' ({collection.count()} ท่อน) ลบแล้วกู้คืนไม่ได้")
+    confirm = input(f"พิมพ์ชื่อ '{name}' อีกครั้งเพื่อยืนยัน: ").strip()
+
+    if confirm != name:
+        print("ยกเลิกการลบ")
+        return
+
+    client.delete_collection(name)
+    print(f"ลบ '{name}' แล้ว")
+
+
+def choose_collection(client, requested):
+    """เลือก collection ที่จะค้น
+
+    - ระบุ --collection มา → ใช้ชื่อนั้น (ถ้าไม่มีอยู่จริง แสดงรายชื่อแล้วจบ)
+    - ไม่ระบุ และมีแค่ collection เดียว → ใช้อันนั้นเลย
+    - ไม่ระบุ และมีหลาย collection → แสดงรายชื่อให้เลือกแล้วจบ
+    """
+    collections = client.list_collections()
+    if len(collections) == 0:
+        print("✘ ยังไม่มี collection ใน ChromaDB ให้รัน python scripts\\build_index.py ก่อน")
+        sys.exit(1)
+
+    if requested is not None:
+        for collection in collections:
+            if collection.name == requested:
+                return collection
+        print(f"✘ ไม่พบ collection '{requested}'")
+        print_collections(client)
+        sys.exit(1)
+
+    if len(collections) == 1:
+        return collections[0]
+
+    print("✘ มีหลาย collection ให้ระบุว่าจะค้นอันไหนด้วย --collection")
+    print_collections(client)
+    sys.exit(1)
 
 
 def search(collection, model, query_prefix: str, question: str, top_k: int, title) -> list[dict]:
@@ -142,19 +221,29 @@ def run_one(collection, model, query_prefix: str, question: str, args):
 
 def main():
     args = parse_args()
+    client = open_client()
+
+    # โหมดจัดการ collection: ทำแล้วจบ ไม่ต้องโหลดโมเดล
+    if args.list:
+        print_collections(client)
+        return
+    if args.delete is not None:
+        delete_collection(client, args.delete)
+        return
+
     device = decide_device(args.device)
 
-    # ① เปิดดัชนี แล้วอ่านการตั้งค่าที่ build_index.py จดไว้
-    collection = open_collection()
+    # ① เลือก collection แล้วอ่านการตั้งค่าที่ build_index.py จดไว้
+    collection = choose_collection(client, args.collection)
     settings = collection.metadata or {}
     model_name = settings.get("embedding_model")
     query_prefix = settings.get("query_prefix", "")
 
     if model_name is None:
-        print("✘ ดัชนีนี้ไม่ได้บันทึกชื่อโมเดลไว้ ให้รัน build_index.py ใหม่")
+        print(f"✘ collection '{collection.name}' ไม่ได้บันทึกชื่อโมเดลไว้ ให้รัน build_index.py ใหม่")
         sys.exit(1)
 
-    print(f"เปิดดัชนี {INDEX_DIR}: {collection.count()} ท่อน")
+    print(f"เปิด collection '{collection.name}' ใน {INDEX_DIR}: {collection.count()} ท่อน")
     if args.title is not None:
         print(f"กรองเฉพาะบทความ: {args.title}")
 
